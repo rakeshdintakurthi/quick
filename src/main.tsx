@@ -13,31 +13,32 @@ if (shareCode) {
   // Quick Assist window mode - show simplified editor view
   async function initQuickAssistWindow() {
     try {
-      // Try to get session from shared session, or create a temporary one
-      let sessionId = '';
-      try {
-        // Check if we can find the session from shared_sessions
-        const { collaborationService } = await import('./lib/collaboration');
-        const sharedSession = await collaborationService.joinSharedSession(shareCode);
-        sessionId = sharedSession.session_id;
-      } catch {
-        // If not found, create a temporary session
-        const session = await db.sessions.create('javascript', 'Quick Assist Session');
-        sessionId = session.id;
-      }
+      // Create a temporary session for the Quick Assist window
+      // It will try to connect to the actual shared session
+      const session = await db.sessions.create('javascript', 'Quick Assist Session');
       
       const root = createRoot(document.getElementById('root')!);
       root.render(
         <StrictMode>
-          <QuickAssistWindow sessionId={sessionId} shareCode={shareCode} />
+          <QuickAssistWindow sessionId={session.id} shareCode={shareCode} />
         </StrictMode>
       );
     } catch (error) {
       console.error('Error initializing Quick Assist window:', error);
       const root = createRoot(document.getElementById('root')!);
       root.render(
-        <div className="h-screen flex items-center justify-center bg-slate-900 text-red-400">
-          Failed to initialize Quick Assist window. Make sure you have the correct share code.
+        <div className="h-screen flex items-center justify-center bg-slate-900">
+          <div className="text-center max-w-md px-6">
+            <div className="text-red-400 mb-4">⚠️ Error initializing Quick Assist window</div>
+            <p className="text-slate-300 mb-2">Share Code: <span className="font-mono font-bold text-blue-400">{shareCode}</span></p>
+            <p className="text-sm text-slate-400">Please make sure the host has created a Quick Assist session with this code.</p>
+            <button
+              onClick={() => window.location.reload()}
+              className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded"
+            >
+              Retry
+            </button>
+          </div>
         </div>
       );
     }

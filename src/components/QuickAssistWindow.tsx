@@ -68,12 +68,15 @@ export default function QuickAssistWindow({ sessionId, shareCode, onClose }: Qui
     );
   }
 
-  if (!isConnected) {
+  if (!isConnected && !sharedSession) {
     return (
       <div className="h-screen flex items-center justify-center bg-slate-900">
-        <div className="text-center">
+        <div className="text-center max-w-md px-6">
           <Loader2 className="w-12 h-12 text-blue-400 animate-spin mx-auto mb-4" />
-          <p className="text-slate-300">Connecting to Quick Assist session...</p>
+          <p className="text-slate-300 mb-2">Waiting for session to start...</p>
+          <p className="text-sm text-slate-400 mb-4">Share Code: <span className="font-mono font-bold text-blue-400">{shareCode}</span></p>
+          <p className="text-xs text-slate-500">The host needs to create a Quick Assist session with this code.</p>
+          <p className="text-xs text-slate-500 mt-2">This window will connect automatically when ready.</p>
         </div>
       </div>
     );
@@ -114,6 +117,7 @@ function QuickAssistEditor({ sessionId, shareCode }: { sessionId: string; shareC
   // Try to join or create collaboration session
   useEffect(() => {
     let cleanup: (() => void) | undefined;
+    let retryInterval: NodeJS.Timeout | undefined;
     
     async function connectToSession() {
       try {
@@ -144,10 +148,24 @@ function QuickAssistEditor({ sessionId, shareCode }: { sessionId: string; shareC
             console.log('Guest left');
           },
         });
+        
+        // Clear retry interval if session found
+        if (retryInterval) {
+          clearInterval(retryInterval);
+        }
       } catch (error) {
-        console.log('Could not join session, trying local window communication...', error);
-        // Fallback to window.postMessage for local popups
+        console.log('Session not yet available, will keep trying...', error);
+        setIsConnected(false);
+        
+        // Setup local window sync as fallback
         cleanup = setupLocalWindowSync();
+        
+        // Retry to join session every 2 seconds (session might be created soon)
+        if (!retryInterval) {
+          retryInterval = setInterval(() => {
+            connectToSession();
+          }, 2000);
+        }
       }
     }
 
@@ -156,6 +174,7 @@ function QuickAssistEditor({ sessionId, shareCode }: { sessionId: string; shareC
     return () => {
       collaborationService.unsubscribe();
       if (cleanup) cleanup();
+      if (retryInterval) clearInterval(retryInterval);
     };
   }, [shareCode, sessionId, language]);
 
@@ -184,6 +203,9 @@ function QuickAssistEditor({ sessionId, shareCode }: { sessionId: string; shareC
       const interval = setInterval(() => {
         window.opener?.postMessage({ type: 'request-code', shareCode }, window.location.origin);
       }, 500);
+      
+      // Also mark as connected for local windows
+      setIsConnected(true);
 
       return () => {
         clearInterval(interval);
@@ -191,10 +213,15 @@ function QuickAssistEditor({ sessionId, shareCode }: { sessionId: string; shareC
       };
     } else {
       // No opener - try to load from localStorage (direct link scenario)
+      // This allows the window to work standalone while waiting for session
       const storageKey = `editor-code:${sessionId}:${language}`;
       const saved = localStorage.getItem(storageKey);
       if (saved) {
         setCode(saved);
+        setIsConnected(true);
+      } else {
+        // Set default code so editor is usable
+        setCode('// Waiting for host to share code...\n// You can start typing here in the meantime.\n');
         setIsConnected(true);
       }
       return () => {

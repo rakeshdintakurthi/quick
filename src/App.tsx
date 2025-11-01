@@ -1,10 +1,13 @@
 import { useState, useEffect } from 'react';
-import { Code, BarChart3, Settings as SettingsIcon } from 'lucide-react';
+import { Code, BarChart3, Settings as SettingsIcon, Users } from 'lucide-react';
 import CodeEditor from './components/CodeEditor';
 import Dashboard from './components/Dashboard';
 import Settings from './components/Settings';
+import QuickAssistPanel from './components/QuickAssistPanel';
 import { db } from './lib/database';
 import { isMock } from './lib/supabase';
+import { windowShareService } from './lib/windowShare';
+import type { SharedSession } from './lib/collaboration';
 
 type View = 'editor' | 'dashboard' | 'settings';
 
@@ -13,6 +16,9 @@ function App() {
   const [sessionId, setSessionId] = useState<string>('');
   const [language, setLanguage] = useState('javascript');
   const [code, setCode] = useState<string>('// Start typing your code here...\n');
+  const [isQuickAssistPanelOpen, setIsQuickAssistPanelOpen] = useState(false);
+  const [sharedSession, setSharedSession] = useState<SharedSession | null>(null);
+  const [isHost, setIsHost] = useState(false);
 
   useEffect(() => {
     initializeSession();
@@ -37,6 +43,16 @@ function App() {
     }
     const saved = sessionId ? localStorage.getItem(getStorageKey(sessionId, newLanguage)) : null;
     if (saved != null) setCode(saved);
+    
+    // Send language updates to Quick Assist windows
+    if (sharedSession) {
+      const shareCode = sharedSession.share_code;
+      windowShareService.postMessageToWindow(shareCode, {
+        type: 'language-update',
+        language: newLanguage,
+        shareCode,
+      });
+    }
   }
 
   function handleCodeChange(newCode: string) {
@@ -45,8 +61,43 @@ function App() {
       localStorage.setItem(getStorageKey(sessionId, language), newCode);
       // optional: mirror to mock DB for analytics if desired
       db.codeContext.create(sessionId, newCode, language);
+      
+      // Send code updates to Quick Assist windows
+      if (sharedSession) {
+        const shareCode = sharedSession.share_code;
+        windowShareService.postMessageToWindow(shareCode, {
+          type: 'code-update',
+          code: newCode,
+          shareCode,
+        });
+      }
     }
   }
+  
+  // Listen for code updates from Quick Assist windows (guest edits)
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      
+      if (event.data.type === 'guest-code-update' && sharedSession) {
+        setCode(event.data.code);
+        const storageKey = getStorageKey(sessionId, language);
+        localStorage.setItem(storageKey, event.data.code);
+      } else if (event.data.type === 'request-code' && sharedSession) {
+        // Respond to code requests from Quick Assist windows
+        const shareCode = event.data.shareCode;
+        windowShareService.postMessageToWindow(shareCode, {
+          type: 'sync-state',
+          code,
+          language,
+          shareCode,
+        });
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [code, language, sharedSession, sessionId]);
 
   function getStorageKey(sessId: string, lang: string) {
     return `editor-code:${sessId}:${lang}`;
@@ -105,6 +156,20 @@ function App() {
               <SettingsIcon className="w-4 h-4" />
               Settings
             </button>
+            {currentView === 'editor' && sessionId && (
+              <button
+                onClick={() => setIsQuickAssistPanelOpen(true)}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
+                  sharedSession
+                    ? 'bg-green-600 text-white'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-700'
+                }`}
+                title="Quick Assist - Share or Join Session"
+              >
+                <Users className="w-4 h-4" />
+                {sharedSession ? 'Collaborating' : 'Quick Assist'}
+              </button>
+            )}
           </nav>
         </div>
       </header>
@@ -117,11 +182,31 @@ function App() {
             code={code}
             onCodeChange={handleCodeChange}
             onLanguageChange={handleLanguageChange}
+            sharedSession={sharedSession}
+            isHost={isHost}
           />
         )}
         {currentView === 'dashboard' && <Dashboard />}
         {currentView === 'settings' && <Settings />}
       </main>
+
+      {sessionId && (
+        <QuickAssistPanel
+          isOpen={isQuickAssistPanelOpen}
+          onClose={() => setIsQuickAssistPanelOpen(false)}
+          sessionId={sessionId}
+          onSessionStart={(session, host) => {
+            setSharedSession(session);
+            setIsHost(host);
+          }}
+          onSessionEnd={() => {
+            setSharedSession(null);
+            setIsHost(false);
+          }}
+          currentSharedSession={sharedSession}
+          isHost={isHost}
+        />
+      )}
     </div>
   );
 }

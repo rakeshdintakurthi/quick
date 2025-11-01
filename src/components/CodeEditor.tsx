@@ -3,7 +3,10 @@ import Editor, { Monaco } from '@monaco-editor/react';
 import type { editor } from 'monaco-editor';
 import { aiService, AIRequest } from '../lib/aiService';
 import { db } from '../lib/database';
-import { Sparkles, Loader2 } from 'lucide-react';
+import { Sparkles, Loader2, Zap } from 'lucide-react';
+import QuickAssist from './QuickAssist';
+import { collaborationService } from '../lib/collaboration';
+import type { SharedSession } from '../lib/collaboration';
 
 interface CodeEditorProps {
   sessionId: string;
@@ -11,9 +14,11 @@ interface CodeEditorProps {
   code: string;
   onCodeChange: (code: string) => void;
   onLanguageChange: (lang: string) => void;
+  sharedSession?: SharedSession | null;
+  isHost?: boolean;
 }
 
-export default function CodeEditor({ sessionId, language, code, onCodeChange, onLanguageChange }: CodeEditorProps) {
+export default function CodeEditor({ sessionId, language, code, onCodeChange, onLanguageChange, sharedSession, isHost }: CodeEditorProps) {
   const [isAIProcessing, setIsAIProcessing] = useState(false);
   const [suggestion, setSuggestion] = useState<{
     text: string;
@@ -24,9 +29,100 @@ export default function CodeEditor({ sessionId, language, code, onCodeChange, on
   } | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [runOutput, setRunOutput] = useState('');
+  const [isQuickAssistOpen, setIsQuickAssistOpen] = useState(false);
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout>();
+  const codeSyncTimeoutRef = useRef<NodeJS.Timeout>();
+  const isApplyingRemoteChange = useRef(false);
+
+  // Collaboration: Subscribe to shared session
+  useEffect(() => {
+    if (!sharedSession) {
+      collaborationService.unsubscribe();
+      return;
+    }
+
+      collaborationService.subscribeToSession(sharedSession, {
+      onCodeChange: (newCode, userId) => {
+        if (userId === collaborationService.getUserId()) return;
+        isApplyingRemoteChange.current = true;
+        onCodeChange(newCode);
+        if (editorRef.current) {
+          editorRef.current.setValue(newCode);
+        }
+        setTimeout(() => {
+          isApplyingRemoteChange.current = false;
+        }, 100);
+      },
+      onLanguageChange: (newLanguage, userId) => {
+        if (userId === collaborationService.getUserId()) return;
+        isApplyingRemoteChange.current = true;
+        onLanguageChange(newLanguage);
+        setTimeout(() => {
+          isApplyingRemoteChange.current = false;
+        }, 100);
+      },
+      onCursorChange: (line, column, userId) => {
+        // Could add cursor indicators here in the future
+      },
+      onGuestJoin: (guestId) => {
+        console.log('Guest joined:', guestId);
+      },
+      onGuestLeave: (guestId) => {
+        console.log('Guest left:', guestId);
+      },
+    });
+
+    return () => {
+      collaborationService.unsubscribe();
+    };
+  }, [sharedSession]);
+
+  // Collaboration: Sync code changes
+  useEffect(() => {
+    if (!sharedSession || isApplyingRemoteChange.current) return;
+    
+    // Don't sync if guest has view-only permissions
+    if (!isHost && sharedSession.permissions === 'view') return;
+
+    if (codeSyncTimeoutRef.current) {
+      clearTimeout(codeSyncTimeoutRef.current);
+    }
+
+    codeSyncTimeoutRef.current = setTimeout(() => {
+      collaborationService.syncCode(sharedSession.id, code, language);
+    }, 500); // Debounce sync
+
+    return () => {
+      if (codeSyncTimeoutRef.current) {
+        clearTimeout(codeSyncTimeoutRef.current);
+      }
+    };
+  }, [code, sharedSession, language, isHost]);
+
+  // Collaboration: Sync language changes
+  useEffect(() => {
+    if (!sharedSession || isApplyingRemoteChange.current) return;
+    
+    // Don't sync if guest has view-only permissions
+    if (!isHost && sharedSession.permissions === 'view') return;
+    
+    collaborationService.syncLanguage(sharedSession.id, language);
+  }, [language, sharedSession, isHost]);
+
+  // Global keyboard shortcut handler for Ctrl+K
+  useEffect(() => {
+    function handleGlobalKeyDown(e: KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        setIsQuickAssistOpen(true);
+      }
+    }
+
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, []);
 
   const languages = [
     { value: 'javascript', label: 'JavaScript' },
@@ -62,6 +158,10 @@ export default function CodeEditor({ sessionId, language, code, onCodeChange, on
         applySuggestion();
       }
     });
+
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK, () => {
+      setIsQuickAssistOpen(true);
+    });
   }
 
   async function handleManualSuggestion(requestType: AIRequest['requestType']) {
@@ -73,6 +173,15 @@ export default function CodeEditor({ sessionId, language, code, onCodeChange, on
 
     if (!position) return;
 
+    await getSuggestion(code, position, requestType);
+  }
+
+  async function handleQuickAssistAction(requestType: AIRequest['requestType']) {
+    if (!editorRef.current || isAIProcessing) return;
+    const editor = editorRef.current;
+    const position = editor.getPosition();
+    const code = editor.getValue();
+    if (!position) return;
     await getSuggestion(code, position, requestType);
   }
 
@@ -145,7 +254,7 @@ export default function CodeEditor({ sessionId, language, code, onCodeChange, on
             suggestion.line,
             suggestion.column + 100
           ),
-          text: suggestion.suggestion,
+          text: suggestion.text,
         },
       ]);
 
@@ -159,6 +268,11 @@ export default function CodeEditor({ sessionId, language, code, onCodeChange, on
   }
 
   function handleEditorChange(value: string | undefined) {
+    // Check if user has edit permissions
+    if (sharedSession && !isHost && sharedSession.permissions === 'view') {
+      return; // Guest with view-only permissions cannot edit
+    }
+
     const newCode = value || '';
     onCodeChange(newCode);
   }
@@ -236,20 +350,29 @@ export default function CodeEditor({ sessionId, language, code, onCodeChange, on
           >
             {isRunning ? 'Running…' : 'Run'}
           </button>
+          <button
+            onClick={() => setIsQuickAssistOpen(true)}
+            className="ml-2 px-4 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-white text-sm flex items-center gap-2"
+            title="Open Quick Assist (Ctrl+K)"
+          >
+            <Zap className="w-4 h-4" />
+            Quick Assist
+          </button>
         </div>
         <div className="flex items-center gap-2 text-sm text-slate-400">
-          <kbd className="px-2 py-1 bg-slate-700 rounded border border-slate-600">Ctrl+Space</kbd>
+          <kbd className="px-2 py-1 bg-slate-700 rounded border border-slate-600">Ctrl+K</kbd>
+          <span>Quick Assist</span>
+          <kbd className="px-2 py-1 bg-slate-700 rounded border border-slate-600 ml-3">Ctrl+Space</kbd>
           <span>Suggest</span>
-          <kbd className="px-2 py-1 bg-slate-700 rounded border border-slate-600 ml-3">Alt+D</kbd>
-          <span>Docs</span>
-          <kbd className="px-2 py-1 bg-slate-700 rounded border border-slate-600 ml-3">Alt+O</kbd>
-          <span>Optimize</span>
-          <kbd className="px-2 py-1 bg-slate-700 rounded border border-slate-600 ml-3">Alt+B</kbd>
-          <span>Debug</span>
         </div>
       </div>
 
       <div className="flex-1 relative">
+        {sharedSession && !isHost && sharedSession.permissions === 'view' && (
+          <div className="absolute top-2 left-2 z-10 bg-yellow-500/20 border border-yellow-500/30 text-yellow-400 px-3 py-1.5 rounded-lg text-sm flex items-center gap-2">
+            <span>👁️ View Only Mode</span>
+          </div>
+        )}
         <Editor
           height="100%"
           language={language}
@@ -267,6 +390,7 @@ export default function CodeEditor({ sessionId, language, code, onCodeChange, on
             tabSize: 2,
             quickSuggestions: false,
             suggestOnTriggerCharacters: false,
+            readOnly: sharedSession && !isHost && sharedSession.permissions === 'view',
           }}
         />
 
@@ -319,6 +443,12 @@ export default function CodeEditor({ sessionId, language, code, onCodeChange, on
             </div>
           </div>
         )}
+
+        <QuickAssist
+          isOpen={isQuickAssistOpen}
+          onClose={() => setIsQuickAssistOpen(false)}
+          onActionSelect={handleQuickAssistAction}
+        />
       </div>
     </div>
   );
